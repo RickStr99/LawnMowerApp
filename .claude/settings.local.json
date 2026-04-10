@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Bash(echo $ANDROID_HOME)",
+      "Bash(echo $ANDROID_SDK_ROOT)",
+      "Bash(ls *.json *.js *.ts)",
+      "WebSearch",
+      "Bash(npx tsc:*)",
+      "Bash(eas --version)"
+    ]
+  }
+}

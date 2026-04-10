@@ -44,6 +44,9 @@ type BfsNode = { col: number; row: number; cost: number };
 
 // Used inside computePath
 type MowRun = PathPoint[];
+type ZoneEntry = { cells: Set<string>; dir: MowDirection };
+interface CellEntry { col: number; row: number; cross: number }
+interface RunEntry { cells: MowRun; first: PathPoint; last: PathPoint }
 
 interface PathPoint {
   col: number;
@@ -386,14 +389,19 @@ function computePath(
     return total;
   };
 
-  const getBestDir = (region: Set<string>): MowDirection => {
-    // If user has locked a direction, use it for every region
-    if (forcedDirection) return forcedDirection;
-    const mowable = new Set<string>();
-    for (const key of region) {
+  // 2. Helper: mowable cells in a set (excludes driveways)
+  const getMowable = (cells: Set<string>): Set<string> => {
+    const m = new Set<string>();
+    for (const key of cells) {
       const [c, r] = key.split(',').map(Number);
-      if (!isDriveway(c, r)) mowable.add(key);
+      if (!isDriveway(c, r)) m.add(key);
     }
+    return m;
+  };
+
+  const bestDirFor = (cells: Set<string>): MowDirection => {
+    if (forcedDirection) return forcedDirection;
+    const mowable = getMowable(cells);
     if (mowable.size === 0) return 'vertical';
     const dirs: MowDirection[] = ['vertical', 'horizontal', 'diag-nwse', 'diag-nesw'];
     return dirs.reduce((best, dir) =>
@@ -401,38 +409,94 @@ function computePath(
     );
   };
 
-  const regionDirs = regions.map(getBestDir);
+  const runsFor = (cells: Set<string>): number => {
+    const mowable = getMowable(cells);
+    if (mowable.size === 0) return 0;
+    return countRunsForDir(mowable, bestDirFor(cells));
+  };
 
-  // 3. Order regions by nearest-neighbour from current position
-  const unvisited = new Set<number>(regions.map((_, i) => i));
-  const regionOrder: number[] = [];
+  // Recursively split a zone into sub-zones with different optimal directions.
+  // At each level, try every vertical (by column) and horizontal (by row) split.
+  // Accept the split that most reduces total contiguous runs. Recurse up to depth 2.
+  const splitZone = (cells: Set<string>, depth: number): ZoneEntry[] => {
+    // When direction is forced or zone is tiny, no split needed
+    if (forcedDirection || depth >= 2 || cells.size < 6) {
+      return [{ cells, dir: bestDirFor(cells) }];
+    }
+
+    const baseRuns = runsFor(cells);
+    let minC = Infinity, maxC = -Infinity, minR = Infinity, maxR = -Infinity;
+    for (const key of cells) {
+      const [c, r] = key.split(',').map(Number);
+      minC = Math.min(minC, c); maxC = Math.max(maxC, c);
+      minR = Math.min(minR, r); maxR = Math.max(maxR, r);
+    }
+
+    let bestRuns = baseRuns;
+    let bestA: Set<string> | null = null;
+    let bestB: Set<string> | null = null;
+
+    // Try every vertical split (left: c < sc, right: c >= sc)
+    for (let sc = minC + 1; sc <= maxC; sc++) {
+      const a = new Set<string>(), b = new Set<string>();
+      for (const key of cells) {
+        const [c] = key.split(',').map(Number);
+        (c < sc ? a : b).add(key);
+      }
+      if (a.size === 0 || b.size === 0) continue;
+      const runs = runsFor(a) + runsFor(b);
+      if (runs < bestRuns) { bestRuns = runs; bestA = a; bestB = b; }
+    }
+
+    // Try every horizontal split (top: r < sr, bottom: r >= sr)
+    for (let sr = minR + 1; sr <= maxR; sr++) {
+      const a = new Set<string>(), b = new Set<string>();
+      for (const key of cells) {
+        const [, r] = key.split(',').map(Number);
+        (r < sr ? a : b).add(key);
+      }
+      if (a.size === 0 || b.size === 0) continue;
+      const runs = runsFor(a) + runsFor(b);
+      if (runs < bestRuns) { bestRuns = runs; bestA = a; bestB = b; }
+    }
+
+    if (!bestA || !bestB) return [{ cells, dir: bestDirFor(cells) }];
+    return [...splitZone(bestA, depth + 1), ...splitZone(bestB, depth + 1)];
+  };
+
+  // Produce all zones across all connected regions
+  const allZones: ZoneEntry[] = regions.flatMap(r => splitZone(r, 0));
+
+  // 3. Order zones by nearest-neighbour from current position
+  const unvisited = new Set<number>(allZones.map((_, i) => i));
+  const zoneOrder: number[] = [];
   let curCol = startCol;
   let curRow = startRow;
 
-  // Find the region that contains startCell (or nearest to it)
-  let firstRegion = -1;
+  // Find the zone that contains startCell (or nearest to it)
+  let firstZone = -1;
   const startKey = `${startCol},${startRow}`;
-  for (let i = 0; i < regions.length; i++) {
-    if (regions[i].has(startKey)) { firstRegion = i; break; }
+  for (let i = 0; i < allZones.length; i++) {
+    if (allZones[i].cells.has(startKey)) { firstZone = i; break; }
   }
-  if (firstRegion < 0) {
+  if (firstZone < 0) {
     let minD = Infinity;
-    for (let i = 0; i < regions.length; i++) {
-      for (const key of regions[i]) {
+    for (let i = 0; i < allZones.length; i++) {
+      for (const key of allZones[i].cells) {
         const [c, r] = key.split(',').map(Number);
         const d = Math.abs(c - curCol) + Math.abs(r - curRow);
-        if (d < minD) { minD = d; firstRegion = i; }
+        if (d < minD) { minD = d; firstZone = i; }
       }
     }
   }
 
   while (unvisited.size > 0) {
-    let next = (firstRegion >= 0 && unvisited.has(firstRegion)) ? firstRegion : -1;
-    firstRegion = -1;
+    let next = (firstZone >= 0 && unvisited.has(firstZone)) ? firstZone : -1;
+    firstZone = -1;
     if (next < 0) {
       let minD = Infinity;
       for (const i of unvisited) {
-        for (const key of regions[i]) {
+        for (const key of allZones[i].cells) {
           const [c, r] = key.split(',').map(Number);
           const d = Math.abs(c - curCol) + Math.abs(r - curRow);
           if (d < minD) { minD = d; next = i; }
@@ -440,10 +504,9 @@ function computePath(
       }
     }
     unvisited.delete(next);
-    regionOrder.push(next);
-    // Update curPos estimate to last cell of this region (refined after strips are built)
-    const cells = [...regions[next]];
-    const [lc, lr] = cells[cells.length - 1].split(',').map(Number);
+    zoneOrder.push(next);
+    const zcells = [...allZones[next].cells];
+    const [lc, lr] = zcells[zcells.length - 1].split(',').map(Number);
     curCol = lc; curRow = lr;
   }
 
@@ -459,7 +522,6 @@ function computePath(
     entryCol: number,
     entryRow: number,
   ): MowRun[] => {
-    interface CellEntry { col: number; row: number; cross: number }
     const stripMap = new Map<number, CellEntry[]>();
     for (const key of region) {
       const [c, r] = key.split(',').map(Number);
@@ -476,7 +538,6 @@ function computePath(
     }
 
     // Split each strip into runs at obstacle/driveway gaps
-    interface RunEntry { cells: MowRun; first: PathPoint; last: PathPoint }
     const allRuns: RunEntry[] = [];
     for (const entries of stripMap.values()) {
       entries.sort((a, b) => a.cross - b.cross);
@@ -542,9 +603,9 @@ function computePath(
     if (!p.transit) mowed.add(`${p.col},${p.row}`);
   };
 
-  for (const ri of regionOrder) {
-    const dir = regionDirs[ri];
-    const runs = makeRegionRuns(regions[ri], dir, curPos.col, curPos.row);
+  for (const zi of zoneOrder) {
+    const { cells, dir } = allZones[zi];
+    const runs = makeRegionRuns(cells, dir, curPos.col, curPos.row);
     for (const run of runs) {
       for (const p of run) appendCell(p, dir);
     }
@@ -554,12 +615,11 @@ function computePath(
     }
   }
 
-  // 6. Dominant direction = direction used by the region with the most mowable cells
+  // 6. Dominant direction = direction used by the zone with the most mowable cells
   const dirCells = new Map<MowDirection, number>();
-  for (let i = 0; i < regions.length; i++) {
-    const dir = regionDirs[i];
+  for (const { cells, dir } of allZones) {
     let count = 0;
-    for (const key of regions[i]) {
+    for (const key of cells) {
       const [c, r] = key.split(',').map(Number);
       if (!isDriveway(c, r)) count++;
     }
